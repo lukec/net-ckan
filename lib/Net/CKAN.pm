@@ -12,16 +12,16 @@ has 'user_agent' => (is => 'ro', isa => 'LWP::UserAgent', lazy_build => 1);
 
 sub get_packages {
     my $self = shift;
-    return $self->get_json('/package');
+    return $self->_get_json('/package');
 }
 
 sub get_package {
     my $self = shift;
     my $name = shift;
-    return $self->get_json("/package/$name");
+    return $self->_get_json("/package/$name");
 }
 
-sub get_json {
+sub _get_json {
     my $self         = shift;
     my $relative_url = shift;
 

@@ -1,7 +1,8 @@
 package Net::CKAN;
 use Moose;
 use LWP::UserAgent;
-use JSON qw/decode_json/;
+use URI::Escape;
+use JSON qw/decode_json encode_json/;
 use Carp qw/croak/;
 use namespace::clean -except => 'meta';
 
@@ -19,6 +20,34 @@ sub get_package {
     my $self = shift;
     my $name = shift;
     return $self->_get_json("/package/$name");
+}
+
+sub update_package {
+    my $self = shift;
+    my $name = shift;
+    my $package = shift;
+
+    return $self->_post_content("/package/$name", $package);
+}
+
+sub create_package {
+    my $self = shift;
+    my $package = shift;
+
+    return $self->_post_content('/package', $package);
+}
+
+sub _post_content {
+    my $self = shift;
+    my $url  = shift;
+    my $data = shift;
+    my $ua   = $self->user_agent;
+    $url = $self->api_base . $url;
+
+    my $json = JSON->new->utf8(1)->pretty(1)->encode($data);
+    my $resp = $ua->post($url, Content => {$json => 1});
+    croak "Could not fetch $url: ", $resp->status_line, $resp->content, "\n"
+        if $resp->code != 200;
 }
 
 sub _get_json {

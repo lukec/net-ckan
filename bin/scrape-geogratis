@@ -10,64 +10,93 @@ my $ckan = Net::CKAN->new(
     server => 'http://ca.ckan.net',
     api_key => '53c7b7cb-b771-45f0-86f3-e7613e760ddb',
 );
+my %packages = map { $_ => 1 } @{ $ckan->get_packages };
 
-my $page_url = 'http://geogratis.cgdi.gc.ca/geogratis/en/collection/metadata.do?id=67';
-
-my $pkg = {};
-my $page = get($page_url);
-$page =~ m#"(http://\S+\.xml)"# or die "Could not find XML for $page_url";
-my $rsrc = get_xml($1);
-
-set_key(name => $rsrc->{id});
-set_key(url => $page_url);
-set_key(license_id => 9);
-if ($page =~ m#<dt>Calendar Date:</dt>.+?<dd>([\d-]+)</dd>#s) {
-  set_key(version => $1);
+my $all_collections
+    = get('http://geogratis.cgdi.gc.ca/geogratis/en/collection/search.do');
+my $count = 0;
+while ($all_collections =~ m#"/geogratis/en/collection/detail\.do([^"]+)">More details<#g) {
+    my $number = $1;
+    $number =~ s/.+=//;
+    print "Fetching dataset $number ...\n";
+    my $page_url = 'http://geogratis.cgdi.gc.ca/geogratis/en/collection/metadata.do?id='
+        . $number;
+    eval { fetch_collection($page_url) };
+    warn $@ if $@;
 }
-set_key(title => $rsrc->{General}{Title}, \&english_content);
-set_key(notes => $rsrc->{General}{Abstract}, \&english_content);
-# TODO: resources => []
-if ($page =~ m#<dt>Originator:</dt>.+?<dd>([^\<]+)<#s) {
-  set_key(author => $1);
-}
-if ($page =~ m#<a href="mailto:([^"]+)"#s) {
-  set_key(author_email => $1);
-  set_key(maintainer_email => $1);
-}
-if ($page =~ m#<dt>Contact Organization:</dt>.+?<dd>([^\<]+)<#s) {
-  set_key(maintainer => $1);
-}
-$pkg->{extras}{License} = 'http://geogratis.ca/geogratis/en/licence.jsp';
-$pkg->{extras}{Ministry} = 'Natural Resources Canada';
-$pkg->{extras}{'Level of Government'} = 'Federal';
-$pkg->{tags} = [
-    map { $_->{content} }
-      grep { $_->{'xml:lang'} eq 'en' }
-        @{ $rsrc->{General}{KeywordList}{Keyword} }
-];
-
-use Data::Dumper;
-warn Dumper $pkg;
 exit;
 
-my $blah = {
-    state => 'active',
-    tags => [
-                'population',
-                'canada'
-              ],
-};
+
+sub fetch_collection {
+    my $page_url = shift;
+    my $pkg      = {};
+    my $page     = get($page_url);
+    $page =~ m#"(http://\S+\.xml)"# or die "Could not find XML for $page_url";
+    my $rsrc = get_xml($1);
+
+    set_key( $pkg, name => $rsrc->{id},
+        sub {
+            my $data = lc(shift);
+            $data =~ s/[^\w\d\-_]//g;
+            return $data;
+        }
+    );
+    (my $collection_url = $page_url) =~ s#metadata\.do#detail.do#;
+    set_key($pkg, url     => $collection_url);
+    set_key($pkg, license => 'OKD Compliant::Other');
+    if ($page =~ m#<dt>Calendar Date:</dt>.+?<dd>([\d-]+)</dd>#s) {
+        set_key($pkg, version => $1);
+    }
+    set_key($pkg, title => $rsrc->{General}{Title},    \&english_content);
+    set_key($pkg, notes => $rsrc->{General}{Abstract}, \&english_content);
+
+    # TODO: resources => []
+    if ($page =~ m#<dt>Originator:</dt>.+?<dd>([^\<]+)<#s) {
+        set_key($pkg, author => $1);
+    }
+    if ($page =~ m#<a href="mailto:([^"]+)"#s) {
+        set_key($pkg, author_email     => $1);
+        set_key($pkg, maintainer_email => $1);
+    }
+    if ($page =~ m#<dt>Contact Organization:</dt>.+?<dd>([^\<]+)<#s) {
+        set_key($pkg, maintainer => $1);
+    }
+    $pkg->{extras}{'License URL'}
+        = 'http://geogratis.ca/geogratis/en/licence.jsp';
+    $pkg->{extras}{Ministry}              = 'Natural Resources Canada';
+    $pkg->{extras}{'Level of Government'} = 'Federal';
+    $pkg->{tags}                          = [
+        map { s/[^\w\d\-_]+/_/g; $_ }
+            map { $_->{content} }
+            grep { $_->{'xml:lang'} eq 'en' }
+            @{ $rsrc->{General}{KeywordList}{Keyword} }
+    ];
+
+    if ($packages{ $pkg->{name} }) {
+
+        #        $ckan->update_package($pkg->{name}, $pkg);
+        warn "Updated " . $ckan->server . '/package/' . $pkg->{name};
+    }
+    else {
+
+                $ckan->create_package($pkg);
+        warn "Created " . $ckan->server . '/package/' . $pkg->{name};
+    }
+}
 
 sub set_key {
-  my $pkg_key   = shift;
-  my $data      = shift;
-  my $transform = shift || sub { return shift };
+    my $pkg       = shift;
+    my $pkg_key   = shift;
+    my $data      = shift;
+    my $transform = shift || sub { return shift };
 
-  unless ($data) { warn "Undef value found for $pkg_key!"; return }
-  warn "Setting $pkg_key";
-  $data = $transform->($data);
-  unless ($data) { warn "Undef value found after transform for $pkg_key!"; return }
-  $pkg->{$pkg_key} = $data;
+    unless ($data) { warn "Undef value found for $pkg_key!"; return }
+    $data = $transform->($data);
+    unless ($data) {
+        warn "Undef value found after transform for $pkg_key!";
+        return;
+    }
+    $pkg->{$pkg_key} = $data;
 }
 
 
@@ -82,8 +111,10 @@ sub get_xml {
 
 sub english_content {
     my $value = shift;
+    my $content;
     for (@$value) {
-        return $_->{content} if $_->{'xml:lang'} eq 'en';
+        $content = $_->{content} if $_->{'xml:lang'} eq 'en';
     }
-    return undef;
+    $content =~ s/^\s+//s;
+    return $content;
 }

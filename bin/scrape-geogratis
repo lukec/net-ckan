@@ -5,6 +5,7 @@ use lib 'lib';
 use Net::CKAN;
 use XML::Simple;
 use LWP::Simple qw/get/;
+use Carp qw/croak/;
 
 my $ckan = Net::CKAN->new(
     server => 'http://ca.ckan.net',
@@ -18,11 +19,12 @@ my $count = 0;
 while ($all_collections =~ m#"/geogratis/en/collection/detail\.do([^"]+)">More details<#g) {
     my $number = $1;
     $number =~ s/.+=//;
-    print "Fetching dataset $number ...\n";
+    print "$count) Fetching dataset $number ...\n";
     my $page_url = 'http://geogratis.cgdi.gc.ca/geogratis/en/collection/metadata.do?id='
         . $number;
     eval { fetch_collection($page_url) };
-    warn $@ if $@;
+    die $@ if $@;
+    $count++;
 }
 exit;
 
@@ -30,37 +32,76 @@ exit;
 sub fetch_collection {
     my $page_url = shift;
     my $pkg      = {};
-    my $page     = get($page_url);
-    $page =~ m#"(http://\S+\.xml)"# or die "Could not find XML for $page_url";
-    my $rsrc = get_xml($1);
+    my $page_content = get($page_url);
 
-    set_key( $pkg, name => $rsrc->{id},
-        sub {
-            my $data = lc(shift);
-            $data =~ s/[^\w\d\-_]//g;
-            return $data;
-        }
-    );
+    # Defaults for Geogratis
+    set_key($pkg, license => 'OKD Compliant::Other');
+    $pkg->{extras}{'License URL'}
+        = 'http://geogratis.ca/geogratis/en/licence.jsp';
+    $pkg->{extras}{Ministry}              = 'Natural Resources Canada';
+    $pkg->{extras}{'Level of Government'} = 'Federal';
+
+    # Grab the things the XML doesn't include
     (my $collection_url = $page_url) =~ s#metadata\.do#detail.do#;
     set_key($pkg, url     => $collection_url);
-    set_key($pkg, license => 'OKD Compliant::Other');
-    if ($page =~ m#<dt>Calendar Date:</dt>.+?<dd>([\d-]+)</dd>#s) {
+    if ($page_content =~ m#<dt>Calendar Date:</dt>.+?<dd>([\d-]+)</dd>#s) {
         set_key($pkg, version => $1);
     }
-    set_key($pkg, title => $rsrc->{General}{Title},    \&english_content);
-    set_key($pkg, notes => $rsrc->{General}{Abstract}, \&english_content);
-
-    # TODO: resources => []
-    if ($page =~ m#<dt>Originator:</dt>.+?<dd>([^\<]+)<#s) {
+    if ($page_content =~ m#<dt>Originator:</dt>.+?<dd>([^\<]+)<#s) {
         set_key($pkg, author => $1);
     }
-    if ($page =~ m#<a href="mailto:([^"]+)"#s) {
+    if ($page_content =~ m#<a href="mailto:([^"]+)"#s) {
         set_key($pkg, author_email     => $1);
         set_key($pkg, maintainer_email => $1);
     }
-    if ($page =~ m#<dt>Contact Organization:</dt>.+?<dd>([^\<]+)<#s) {
+    if ($page_content =~ m#<dt>Contact Organization:</dt>.+?<dd>([^\<]+)<#s) {
         set_key($pkg, maintainer => $1);
     }
+
+    # Now use the XML if it's available or just scrape the best we can.
+    if ($page_content =~ m#"(http://http://geogratis\.cgdi\.gc\.ca\S+\.xml)"#) {
+        fetch_collection_from_xml(get_xml($1), $pkg);
+    }
+    else {
+        fetch_collection_without_xml($page_content, $pkg);
+    }
+
+    if ($pkg->{name} =~ m/^\d+$/) {
+        die "Turned $pkg->{title} into $pkg->{name}";
+    }
+
+    if (length($pkg->{name}) > 110) {
+        $pkg->{name} =~ s/spatialresolution/sr/;
+        $pkg->{name} =~ s/bi-directional/bi-dir/;
+        # dirreflectancepropertiesofthelandsurfaceovercanadaderivedfrommodismultispectralobservationsat1
+        $pkg->{name} =~ s/derivedfrom\w+//;
+        # gaschromatographydataforcrudeoilscondensatesandrockextractsfromcanadianandselectedinternationalsedimentarybasins
+        $pkg->{name} =~ s/fromcanadianandselectedinternational/cdn-intl/;
+        # multi-spectralclear-skycompositesofmodisterralandchannelsb1-b7overcanadaat250msrand10-dayintervalssincemarch2000topoftheatmospheretoadata
+        # multi-spectralclear-skycompositesofmodisterralandchannelsb1-b7-250m-10d-mar2000topoftheatmospheretoadata
+        $pkg->{name} =~ s/overcanadaat250msrand10-dayintervalssincemarch2000topoftheatmospheretoadata/-250m-10d-mar2000/;
+        $pkg->{name} =~ s//-250m-10d-mar2000/;
+    }
+    die "$pkg->{name} is too long! Add some shortening rules"
+        if length($pkg->{name}) > 130;
+    if (! $packages{ $pkg->{name} }) {
+        warn "Creating from $collection_url";
+        use Data::Dumper;
+        warn Dumper $pkg;
+        $ckan->create_package($pkg);
+        warn "Created " . $ckan->server . '/package/' . $pkg->{name};
+    }
+}
+
+sub fetch_collection_from_xml {
+    my $rsrc = shift;
+    my $pkg  = shift;
+
+    set_key( $pkg, name => $rsrc->{id}, \&name_transformer );
+    set_key($pkg, license => 'OKD Compliant::Other');
+    set_key($pkg, title => $rsrc->{General}{Title},    \&english_content);
+    set_key($pkg, notes => $rsrc->{General}{Abstract} || 'No notes', \&english_content);
+
     $pkg->{extras}{'License URL'}
         = 'http://geogratis.ca/geogratis/en/licence.jsp';
     $pkg->{extras}{Ministry}              = 'Natural Resources Canada';
@@ -71,17 +112,39 @@ sub fetch_collection {
             grep { $_->{'xml:lang'} eq 'en' }
             @{ $rsrc->{General}{KeywordList}{Keyword} }
     ];
+}
 
-    if ($packages{ $pkg->{name} }) {
+sub fetch_collection_without_xml {
+    my $page_content = shift;
+    my $pkg  = shift;
+    my $rsrc;
 
-        #        $ckan->update_package($pkg->{name}, $pkg);
-        warn "Updated " . $ckan->server . '/package/' . $pkg->{name};
+    # notes tags
+    if ($page_content =~ m#<dt>Title:</dt>.+?<dd>([^\<]+)<#s) {
+        set_key($pkg, title => $1);
+        set_key( $pkg, name => $1, \&name_transformer );
     }
-    else {
-
-                $ckan->create_package($pkg);
-        warn "Created " . $ckan->server . '/package/' . $pkg->{name};
+    else { die "Could not find <dt>Title:</dt>..." }
+    if ($page_content =~ m#<dt>Abstract:</dt>\s*.+?\s*<dd>([^\<]+)<#s) {
+        set_key($pkg, notes => $1);
     }
+    else { die "Could not find <dt>Title:</dt>..." }
+
+    my %tags;
+    while ($page_content =~ m#<dt>\w+ Keyword:</dt>\s*.+?\s*<dd>([^\<]+)<#sg) {
+        map { $tags{$_}++ }
+            map { s/[^\w\d\-_]+/_/g; $_ } # normalize tags
+                grep m/\S/,               # skip empties
+                    split ' &gt; ', $1;   # Flatten heirarchy into tags
+    }
+    $pkg->{tags} = [ keys %tags ];
+}
+
+sub name_transformer {
+    my $data = lc(shift);
+    $data =~ s/\s+\|.+//;
+    $data =~ s/[^\w\d\-_]//g;
+    return $data;
 }
 
 sub set_key {
@@ -104,16 +167,21 @@ sub get_xml {
     my $url = shift;
     my $ua = LWP::UserAgent->new;
     my $resp = $ua->get($url);
-    warn "Could not fetch $url: ", $resp->status_line, "\n"
+    warn "Could not GET fetch$url: ", $resp->status_line, "\n"
         if $resp->code != 200;
     return XMLin($resp->content);
 }
 
 sub english_content {
-    my $value = shift;
-    my $content;
-    for (@$value) {
-        $content = $_->{content} if $_->{'xml:lang'} eq 'en';
+    my $value = shift or croak "english_content(undef)!";
+    my $content = '';
+    if (ref($value) eq 'ARRAY') {
+        for (@$value) {
+            $content = $_->{content} if $_->{'xml:lang'} eq 'en';
+        }
+    }
+    else {
+        $content = $value;
     }
     $content =~ s/^\s+//s;
     return $content;

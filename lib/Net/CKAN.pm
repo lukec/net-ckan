@@ -46,7 +46,7 @@ sub _post_content {
 
     my $json = JSON->new->utf8(1)->pretty(1)->encode($data);
     my $resp = $ua->post($url, Content => {$json => 1});
-    croak "Could not fetch $url: ", $resp->status_line, $resp->content, "\n"
+    croak "Could not POST $url: ", $resp->status_line, $resp->content, "\n"
         if $resp->code != 200;
 }
 

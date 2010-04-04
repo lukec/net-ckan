@@ -1,0 +1,72 @@
+#!/usr/bin/env perl
+use strict;
+use warnings;
+use lib 'lib';
+use Net::CKAN;
+use YAML qw/LoadFile/;
+
+my $ckan = Net::CKAN->new(
+    server => 'http://ca.ckan.net',
+    api_key => '53c7b7cb-b771-45f0-86f3-e7613e760ddb',
+);
+print "Fetching list of existing ca.ckan.net packages ...\n";
+my %packages = map { $_ => 1 } @{ $ckan->get_packages };
+
+my $bcdata_file = shift or die "Please specify a BC data file to import.\n";
+my $bcdata = LoadFile($bcdata_file);
+
+for my $data (@$bcdata) {
+    $data->{title} =~ s/\x{b2}/2/;
+    $data->{title} =~ s/\x{a0}//;
+
+    my $pkg = {
+        url => $data->{link},
+        title => $data->{title},
+        author => $data->{agency},
+        maintainer => $data->{agency},
+    };
+    $pkg->{name} = name_transformer($data->{title});
+    $pkg->{notes} = <<EOT;
+$data->{category} => $data->{subtopic}
+
+Data released for the BC Apps for Climate Action contest.
+EOT
+    $pkg->{tags} = [
+        'Apps4ClimateAction',
+        name_transformer($data->{category}),
+        name_transformer($data->{subtopic}),
+        split(m/,\s+/, $data->{format}),
+    ];
+    $pkg->{extras} = {
+        category => $data->{category},
+        subtopic => $data->{subtopic},
+        format => $data->{format},
+        agency_link => $data->{agency_link},
+    };
+ 
+    die "$pkg->{name} is too long! Add some shortening rules"
+        if length($pkg->{name}) > 130;
+    if (! $packages{ $pkg->{name} }) {
+        use Data::Dumper;
+        warn Dumper $pkg;
+        eval { $ckan->create_package($pkg) };
+        if ($@) {
+            if ($@ =~ m/Package name already exists/) {
+                $pkg->{name} = name_transformer("$data->{title} $data->{format}");
+                $ckan->create_package($pkg);
+            }
+            else {
+                die $@;
+            }
+        }
+        warn "Created " . $ckan->server . '/package/' . $pkg->{name};
+    }
+}
+exit;
+
+sub name_transformer {
+    my $data = lc(shift);
+    $data =~ s/\s+\|.+//;
+    $data =~ s/[^\w\d\-_]//g;
+    return $data;
+}
